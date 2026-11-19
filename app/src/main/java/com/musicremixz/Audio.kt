@@ -15,7 +15,7 @@ import kotlin.math.sqrt
 
 const val SR = 11025 // analysis/waveform sample rate (mono)
 
-class Track(val title: String, val artist: String, val file: File, val pcm: FloatArray, val bpm: Double, val camelot: String) {
+class Track(val title: String, val artist: String, val cover: String, val file: File, val pcm: FloatArray, val bpm: Double, val camelot: String) {
     val dur get() = pcm.size.toDouble() / SR
 }
 
