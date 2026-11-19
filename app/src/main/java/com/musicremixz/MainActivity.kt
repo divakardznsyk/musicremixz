@@ -62,6 +62,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.channels.Channel
+import java.io.IOException
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
@@ -87,39 +90,42 @@ class Hit(val title: String, val artist: String, val preview: String, val cover:
 
 private fun open(u: String): HttpURLConnection {
     val c = URL(u).openConnection() as HttpURLConnection
-    c.connectTimeout = 10000
-    c.readTimeout = 15000
+    c.connectTimeout = 5000
+    c.readTimeout = 8000
     c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) MusicRemixz")
     return c
 }
 
 private fun get(u: String): String = open(u).inputStream.bufferedReader().use { it.readText() }
 
-suspend fun search(q: String): List<Hit> = withContext(Dispatchers.IO) {
+private fun deezer(e: String): List<Hit> {
+    val arr = JSONObject(get("https://api.deezer.com/search?limit=25&q=$e")).optJSONArray("data") ?: return emptyList()
+    return List(arr.length()) {
+        val o = arr.getJSONObject(it)
+        Hit(o.optString("title"), o.optJSONObject("artist")?.optString("name") ?: "", o.optString("preview"), o.optJSONObject("album")?.optString("cover_medium") ?: "")
+    }.filter { it.preview.isNotEmpty() }
+}
+
+private fun itunes(e: String): List<Hit> {
+    val arr = JSONObject(get("https://itunes.apple.com/search?media=music&entity=song&limit=25&term=$e")).getJSONArray("results")
+    return List(arr.length()) {
+        val o = arr.getJSONObject(it)
+        Hit(o.optString("trackName"), o.optString("artistName"), o.optString("previewUrl"), o.optString("artworkUrl100").replace("100x100", "300x300"))
+    }.filter { it.preview.isNotEmpty() }
+}
+
+// Both providers run at once; first non-empty answer wins. Detached scope because blocking sockets can't be cancelled.
+suspend fun search(q: String): List<Hit> {
     val e = URLEncoder.encode(q, "UTF-8")
-    val out = mutableListOf<Hit>()
-    try {
-        val arr = JSONObject(get("https://api.deezer.com/search?limit=25&q=$e")).optJSONArray("data")
-        if (arr != null) for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            out += Hit(
-                o.optString("title"), o.optJSONObject("artist")?.optString("name") ?: "",
-                o.optString("preview"), o.optJSONObject("album")?.optString("cover_medium") ?: "",
-            )
-        }
-    } catch (ex: Exception) { /* fall through to iTunes */ }
-    if (out.none { it.preview.isNotEmpty() }) {
-        out.clear()
-        val arr = JSONObject(get("https://itunes.apple.com/search?media=music&entity=song&limit=25&term=$e")).getJSONArray("results")
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            out += Hit(
-                o.optString("trackName"), o.optString("artistName"), o.optString("previewUrl"),
-                o.optString("artworkUrl100").replace("100x100", "300x300"),
-            )
-        }
-    }
-    out.filter { it.preview.isNotEmpty() }
+    val ch = Channel<List<Hit>>(2)
+    val sc = CoroutineScope(Dispatchers.IO)
+    sc.launch { ch.trySend(try { itunes(e) } catch (x: Exception) { emptyList() }) }
+    sc.launch { ch.trySend(try { deezer(e) } catch (x: Exception) { emptyList() }) }
+    return withTimeoutOrNull(9000) {
+        var r = emptyList<Hit>()
+        repeat(2) { if (r.isEmpty()) r = ch.receive() }
+        r
+    } ?: throw IOException("timed out, check your internet")
 }
 
 // ---------- crossfade envelopes ----------
@@ -254,7 +260,7 @@ class Mixer(private val dir: File) {
                     pos = t
                     if (!started && t >= g.lead) {
                         y.start()
-                        y.playbackParams = PlaybackParams().setSpeed(g.rate.toFloat())
+                        runCatching { y.playbackParams = PlaybackParams().setSpeed(g.rate.toFloat()) }
                         started = true
                     }
                     val p = ((t - g.lead) / g.ov).coerceIn(0.0, 1.0)
@@ -264,6 +270,10 @@ class Mixer(private val dir: File) {
                     y.setVolume(vb.toFloat(), vb.toFloat())
                     delay(25)
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                status = "Playback failed: ${e.message}"
             } finally {
                 x?.release()
                 y?.release()
@@ -291,14 +301,31 @@ fun keyNote(a: String, b: String): Pair<String, Boolean> {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Save any crash trace so the next launch can show it.
+        val f = File(filesDir, "crash.txt")
+        val crash = if (f.exists()) f.readText().also { f.delete() } else ""
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching { f.writeText(e.stackTraceToString()) }
+            prev?.uncaughtException(t, e)
+        }
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(primary = GREEN, background = BG, surface = CARD)) { App() }
+            MaterialTheme(colorScheme = darkColorScheme(primary = GREEN, background = BG, surface = CARD)) { App(crash) }
         }
     }
 }
 
 @Composable
-fun App() {
+fun App(crash: String) {
+    var shown by remember { mutableStateOf(crash.isNotEmpty()) }
+    if (shown) {
+        Column(Modifier.fillMaxSize().background(BG).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("The app crashed last time. Screenshot this and send it:", color = Color.White, fontWeight = FontWeight.Bold)
+            Text(crash.take(3500), color = GRAY, fontSize = 10.sp)
+            Pill("Continue", true) { shown = false }
+        }
+        return
+    }
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val m = remember { Mixer(ctx.cacheDir) }
@@ -541,11 +568,11 @@ fun Picker(slot: Int, onClose: () -> Unit, onHit: (Hit) -> Unit, onDevice: () ->
     var busy by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf("") }
     val fr = remember { FocusRequester() }
-    LaunchedEffect(Unit) { fr.requestFocus() }
+    LaunchedEffect(Unit) { delay(300); runCatching { fr.requestFocus() } }
     // Search as you type (debounced).
     LaunchedEffect(q) {
         if (q.isBlank()) { hits = emptyList(); err = ""; return@LaunchedEffect }
-        delay(450)
+        delay(350)
         busy = true
         err = ""
         try {
@@ -555,8 +582,9 @@ fun Picker(slot: Int, onClose: () -> Unit, onHit: (Hit) -> Unit, onDevice: () ->
             throw e
         } catch (e: Exception) {
             err = "Search failed: ${e.message}"
+        } finally {
+            busy = false
         }
-        busy = false
     }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
