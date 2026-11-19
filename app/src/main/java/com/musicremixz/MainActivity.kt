@@ -403,7 +403,7 @@ fun Cover(url: String, size: Dp, seed: Int) {
             try { open(url).inputStream.use { BitmapFactory.decodeStream(it) }?.asImageBitmap() } catch (e: Exception) { null }
         }
     }
-    Box(Modifier.size(size).clip(RoundedCornerShape(6.dp)).background(Color.hsv((seed % 12) * 30f, 0.5f, 0.45f))) {
+    Box(Modifier.size(size).clip(RoundedCornerShape(6.dp)).background(Color.hsv(seed.mod(12) * 30f, 0.5f, 0.45f))) {
         bmp?.let { Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }
     }
 }
